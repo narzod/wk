@@ -43,18 +43,22 @@ const usage = `wk - when do I work?
   wk                 headline + the next 7 days; asks only if today/tomorrow is unknown
   wk -1              headline only (for shell profiles and scripts)
   wk week [next|N]   the Saturday-to-Friday work week (N = weeks from now, e.g. -1)
-  wk ask             fill in every unknown day ahead, one question per day
-  wk DAY SHIFT...    set one day:   wk mon 12-8 truck day
-  wk DAY ?           forget one day
-  wk DAY             show one day
+  wk ask [DAY]       fill in every unknown day ahead (from DAY), one question per day
+  wk DAYS SHIFT...   set days:      wk mon 12-8 truck day     wk mon-wed,fri 9-5:30
+  wk from DAY S S..  set a run of consecutive days, one shift each:
+                                    wk from sat 9-5:30 = off off 12-8 12-8 =
+  wk DAYS ?          forget days
+  wk DAYS            show days
 
-DAY    today, tom, sat..fri (the next one), 11/16, or 2026-11-16
+DAY    today, tom, sat..fri (the next one), +7 (days from today), 11/16, 2026-11-16
+DAYS   one DAY, a range (mon-fri, 11/21-11/27), or a comma list of either
 SHIFT  9-5:30   12-8   7a-3p   13:00-21:30   9 (end unknown)   off
        = means "same as the day before"; anything after the shift is a note.
        Bare hours are guessed: starts 7-11 are am, 12-6 are pm.
 
 Exit code: 0 fine, 1 leave soon, 2 late, 3 today/tomorrow unknown.
-Settings:  WK_FILE (data file path), WK_LEAD (minutes of warning, default 60).
+Settings:  WK_FILE (data file path), WK_LEAD (minutes of warning, default 60),
+           WK_COLOR=always|never (NO_COLOR is also honored), WK_CHEER=0 (no pep line).
 `
 
 // ---------------------------------------------------------------- data
@@ -335,20 +339,34 @@ func dayLabel(d, today time.Time) string {
 	return d.Format("Mon 2")
 }
 
-func until(d time.Duration) string {
+// dur formats a length of time, rounded up to the minute.
+func dur(d time.Duration) string {
 	mins := int((d + time.Minute - 1) / time.Minute)
 	switch {
 	case mins >= 48*60:
-		return fmt.Sprintf("in %d days", mins/(24*60))
+		return fmt.Sprintf("%d days", mins/(24*60))
 	case mins >= 60:
-		return fmt.Sprintf("in %dh %02dm", mins/60, mins%60)
+		return fmt.Sprintf("%dh %02dm", mins/60, mins%60)
 	}
-	return fmt.Sprintf("in %dm", mins)
+	return fmt.Sprintf("%dm", mins)
 }
+
+func until(d time.Duration) string { return "in " + dur(d) }
 
 func capitalize(s string) string { return strings.ToUpper(s[:1]) + s[1:] }
 
-func headline(db schedule, now time.Time, lead time.Duration) (string, int) {
+// head is the headline: the main text, an optional "(tomorrow unknown)" tail,
+// the exit code for the situation, and the colors for the main text.
+type head struct {
+	text, tail string
+	code       int
+	style      []string
+}
+
+func (h head) plain() string  { return h.text + h.tail }
+func (h head) String() string { return paint(h.text, h.style...) + paint(h.tail, yellow) }
+
+func headline(db schedule, now time.Time, lead time.Duration) head {
 	today := dayOf(now)
 	tomorrow := addDays(today, 1)
 	nd, ne, known := upcoming(db, now)
@@ -357,6 +375,7 @@ func headline(db schedule, now time.Time, lead time.Duration) (string, int) {
 
 	var text string
 	code := codeOK
+	style := []string{bold, cyan}
 
 	if cd, ce, ok := current(db, now); ok {
 		start, _ := ce.span(cd)
@@ -365,10 +384,13 @@ func headline(db schedule, now time.Time, lead time.Duration) (string, int) {
 			mins := int(now.Sub(start) / time.Minute)
 			text = fmt.Sprintf("LATE: shift started %s, %dm ago.", clock12(ce.start), mins)
 			code = codeLate
+			style = []string{bold, red}
 		case ce.end < 0:
 			text = fmt.Sprintf("ON SHIFT since %s.", clock12(ce.start))
+			style = []string{bold, green}
 		default:
 			text = fmt.Sprintf("ON SHIFT until %s.", clock12(ce.end))
+			style = []string{bold, green}
 		}
 		switch {
 		case known:
@@ -383,6 +405,7 @@ func headline(db schedule, now time.Time, lead time.Duration) (string, int) {
 		if wait <= lead {
 			text = fmt.Sprintf("LEAVE SOON: %s, %s", clock12(ne.start), until(wait))
 			code = codeSoon
+			style = []string{bold, yellow}
 		} else {
 			text = fmt.Sprintf("NEXT: %s %s, %s", dayLabel(nd, today), clock12(ne.start), until(wait))
 			if te, ok := db[key(today)]; ok && te.off {
@@ -391,19 +414,22 @@ func headline(db schedule, now time.Time, lead time.Duration) (string, int) {
 		}
 	} else if urgentGap {
 		text = fmt.Sprintf("%s UNKNOWN: find out your shift", strings.ToUpper(dayLabel(nd, today)))
+		style = []string{bold, magenta}
 	} else {
 		text = fmt.Sprintf("No shift before %s, and %s is unknown", nd.Format("Mon 2"), nd.Format("Mon"))
+		style = []string{bold}
 	}
 
 	// A known next shift must not hide the fact that tomorrow is a blank.
-	if !tomorrowKnown && !(urgentGap && nd.Equal(tomorrow)) && !urgentGap {
-		text += "  (tomorrow unknown)"
+	tail := ""
+	if !tomorrowKnown && !urgentGap {
+		tail = "  (tomorrow unknown)"
 		urgentGap = true
 	}
 	if urgentGap && code == codeOK {
 		code = codeUnknown
 	}
-	return text, code
+	return head{text, tail, code, style}
 }
 
 // urgentGaps lists the unknown days close enough to interrupt the user about.
@@ -422,21 +448,32 @@ func urgentGaps(db schedule, now time.Time) []time.Time {
 // ---------------------------------------------------------------- listing
 
 func dayLine(db schedule, d time.Time, now time.Time) string {
+	today := dayOf(now)
 	lead := " "
-	if d.Equal(dayOf(now)) {
+	if d.Equal(today) {
 		lead = ">"
 	}
-	body := "?"
+	date := fmt.Sprintf("%s %s %2d", lead, d.Format("Mon"), d.Day())
+	body, bodyStyle := "?", []string{yellow}
 	if e, ok := db[key(d)]; ok {
-		body = e.display()
+		body, bodyStyle = e.display(), nil
+		if e.off {
+			bodyStyle = []string{dim}
+		}
 	}
-	line := fmt.Sprintf("%s %s %2d  %s", lead, d.Format("Mon"), d.Day(), body)
+	mark, markStyle := "", []string{bold, cyan}
 	if cd, _, ok := current(db, now); ok && cd.Equal(d) {
-		line += "   <- now"
+		mark, markStyle = "   <- now", []string{bold, green}
 	} else if nd, _, known := upcoming(db, now); known && nd.Equal(d) {
-		line += "   <- next"
+		mark = "   <- next"
 	}
-	return line
+	switch {
+	case d.Before(today) && mark == "":
+		return paint(date+"  "+body, dim) // the past is settled
+	case d.Equal(today):
+		date = paint(date, bold)
+	}
+	return date + "  " + paint(body, bodyStyle...) + paint(mark, markStyle...)
 }
 
 func list(w io.Writer, db schedule, from time.Time, n int, now time.Time) {
@@ -526,6 +563,11 @@ func parseDay(s string, today time.Time) (time.Time, error) {
 	case "tomorrow", "tom":
 		return addDays(today, 1), nil
 	}
+	if strings.HasPrefix(s, "+") {
+		if n, err := strconv.Atoi(s[1:]); err == nil && n <= 366 {
+			return addDays(today, n), nil
+		}
+	}
 	if len(s) >= 3 {
 		for i := 0; i < 7; i++ {
 			d := addDays(today, i)
@@ -552,6 +594,37 @@ func parseDay(s string, today time.Time) (time.Time, error) {
 		}
 	}
 	return today, fmt.Errorf("don't know the day %q", s)
+}
+
+// parseDays reads one day, a range (mon-fri), or a comma list of either.
+// In a range, the end is looked for on or after the start.
+func parseDays(s string, today time.Time) ([]time.Time, error) {
+	var out []time.Time
+	for _, part := range strings.Split(s, ",") {
+		if d, err := parseDay(part, today); err == nil {
+			out = append(out, d)
+			continue
+		}
+		a, b, ok := strings.Cut(part, "-")
+		if !ok {
+			return nil, fmt.Errorf("don't know the day %q", part)
+		}
+		from, err := parseDay(a, today)
+		if err != nil {
+			return nil, err
+		}
+		to, err := parseDay(b, from)
+		if err != nil {
+			return nil, err
+		}
+		if n := daysBetween(from, to); n < 0 || n > 62 {
+			return nil, fmt.Errorf("range %q runs backwards or is too long", part)
+		}
+		for d := from; !d.After(to); d = addDays(d, 1) {
+			out = append(out, d)
+		}
+	}
+	return out, nil
 }
 
 func isTerminal(f *os.File) bool {
@@ -594,16 +667,26 @@ func run(args []string) (int, error) {
 		return codeError, err
 	}
 
+	initColor()
 	today := dayOf(now)
 	stdin := bufio.NewReader(os.Stdin)
 	show := func() int {
-		text, code := headline(db, now, lead)
-		fmt.Println(text)
-		return code
+		h := headline(db, now, lead)
+		fmt.Println(h)
+		return h.code
+	}
+	pep := func() {
+		if os.Getenv("WK_CHEER") == "0" {
+			return
+		}
+		if c := cheer(db, now); c != "" {
+			fmt.Println(paint(c, dim))
+		}
 	}
 
 	if len(args) == 0 {
 		code := show()
+		pep()
 		fmt.Println()
 		list(os.Stdout, db, today, 7, now)
 		if gaps := urgentGaps(db, now); len(gaps) > 0 && isTerminal(os.Stdin) {
@@ -644,24 +727,32 @@ func run(args []string) (int, error) {
 			}
 		}
 		code := show()
+		pep()
 		start := addDays(weekStart(today), 7*n)
 		fmt.Printf("\nWeek of %s\n", start.Format("Mon Jan 2"))
 		list(os.Stdout, db, start, 7, now)
 		return code, nil
 
 	case "ask":
+		from := today
+		if len(args) > 1 {
+			if from, err = parseDay(args[1], today); err != nil {
+				return codeError, err
+			}
+		}
 		show()
+		pep()
 		fmt.Println()
-		list(os.Stdout, db, today, 7, now)
+		list(os.Stdout, db, from, 7, now)
 		var days []time.Time
 		for i := 0; i < askHorizon; i++ {
-			d := addDays(today, i)
-			if _, ok := db[key(d)]; !ok && (i > 0 || todayOpen(now)) {
+			d := addDays(from, i)
+			if _, ok := db[key(d)]; !ok && (!d.Equal(today) || todayOpen(now)) {
 				days = append(days, d)
 			}
 		}
 		if len(days) == 0 {
-			fmt.Printf("\nNothing unknown in the next %d days.\n", askHorizon)
+			fmt.Printf("\nNothing unknown in those %d days.\n", askHorizon)
 			return show(), nil
 		}
 		fmt.Println()
@@ -670,28 +761,60 @@ func run(args []string) (int, error) {
 		}
 		fmt.Println()
 		return show(), nil
+
+	case "from":
+		if len(args) < 3 {
+			return codeError, fmt.Errorf("wk from DAY SHIFT SHIFT ...   (one shift per day; = repeats, ? forgets)")
+		}
+		start, err := parseDay(args[1], today)
+		if err != nil {
+			return codeError, err
+		}
+		// Nothing is saved unless every shift reads cleanly.
+		for i, tok := range args[2:] {
+			d := addDays(start, i)
+			e, del, err := parseAnswer(db, d, tok)
+			if err != nil {
+				return codeError, fmt.Errorf("%s %d: %v (nothing saved)", d.Format("Mon"), d.Day(), err)
+			}
+			if del {
+				delete(db, key(d))
+			} else {
+				db[key(d)] = e
+			}
+		}
+		if err := save(path, db); err != nil {
+			return codeError, err
+		}
+		list(os.Stdout, db, start, len(args)-2, now)
+		return show(), nil
 	}
 
-	// wk DAY [SHIFT...]
-	d, err := parseDay(args[0], today)
+	// wk DAYS [SHIFT...]
+	days, err := parseDays(args[0], today)
 	if err != nil {
 		return codeError, fmt.Errorf("%v (try: wk help)", err)
 	}
 	if len(args) > 1 {
-		e, del, err := parseAnswer(db, d, strings.Join(args[1:], " "))
-		if err != nil {
-			return codeError, err
-		}
-		if del {
-			delete(db, key(d))
-		} else {
-			db[key(d)] = e
+		answer := strings.Join(args[1:], " ")
+		for _, d := range days {
+			e, del, err := parseAnswer(db, d, answer)
+			if err != nil {
+				return codeError, err
+			}
+			if del {
+				delete(db, key(d))
+			} else {
+				db[key(d)] = e
+			}
 		}
 		if err := save(path, db); err != nil {
 			return codeError, err
 		}
 	}
-	fmt.Println(dayLine(db, d, now))
+	for _, d := range days {
+		fmt.Println(dayLine(db, d, now))
+	}
 	return show(), nil
 }
 
